@@ -80,8 +80,9 @@ serde_json = "1.0"
 uuid = "1.23.3"
 # Optional: native Delta Lake integration via delta-kernel-rs. Engine-agnostic (no DataFusion
 # dependency), pinned to the arrow-58 feature to match Comet's arrow version. Enabled by the
-# `delta` cargo feature; off by default.
-delta_kernel = { version = "0.24.0", default-features = false, features = ["default-engine-rustls", "arrow-58"], optional = true }
+# `delta` cargo feature; off by default. `internal-api` is required for the create-table entry
+# point (the append/transaction path itself is on kernel's public API).
+delta_kernel = { version = "0.24.0", default-features = false, features = ["default-engine-rustls", "arrow-58", "arrow-conversion", "internal-api"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18.0"

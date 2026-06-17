@@ -17,27 +17,37 @@
 
 //! Native Delta Lake integration via `delta-kernel-rs`.
 //!
-//! Compiled only when the `delta` cargo feature is enabled. Kernel runs on the driver to perform
-//! log replay and file enumeration; data reads/writes are routed through Comet's existing Parquet
-//! machinery. See the branch plan for the full phase breakdown.
+//! Compiled only when the `delta` cargo feature is enabled. The kernel performs Delta-specific
+//! work (log replay, file enumeration, deletion vectors, column mapping, partition values, and
+//! transactional commits); Comet only sees plain Apache Arrow `RecordBatch`es on the way in and
+//! out. This keeps the integration minimal — there is no reimplementation of the Delta protocol.
 //!
-//! Phase 1 (this commit) opens a table snapshot through the kernel default engine, proving end to
-//! end that kernel log replay links and runs against Comet's arrow-58 dependency tree. Subsequent
-//! commits add scan-file enumeration, a protobuf `DeltaScan`, the native scan operator, and the
-//! write path.
+//! Implemented here:
+//! - [`snapshot_summary`] / [`list_scan_files`] — log replay + file enumeration.
+//! - [`scan_to_batches`] — full read (deletion vectors and column mapping applied by the kernel).
+//! - [`create_table`] / [`append`] — transactional write (unpartitioned).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::{CommitResult, RetryableTransaction};
+use delta_kernel::{DeltaResult, Error, Snapshot, SnapshotRef};
+use itertools::Itertools;
 use url::Url;
 
-/// A single Delta data file to scan, produced by kernel log replay on the driver. This is the
-/// minimal per-file information Comet needs to later build a `PartitionedFile` for its native
-/// Parquet reader. Partition values, deletion vectors, and column-mapping transforms are carried
-/// in follow-up phases.
+/// The kernel default engine specialized for Comet (tokio-backed object-store IO).
+type KernelEngine = DefaultEngine<TokioBackgroundExecutor>;
+
+/// A single Delta data file to scan, produced by kernel log replay on the driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaScanFile {
     /// File path relative to the table root.
@@ -45,14 +55,26 @@ pub struct DeltaScanFile {
     /// File size in bytes (from the Delta log; lets Comet skip a HEAD/stat call).
     pub size: i64,
     /// Whether the kernel attached a logical-to-physical transform (column mapping / partition
-    /// value injection) that must be applied after reading. Handled in a later phase.
+    /// value injection) that must be applied after reading.
     pub has_transform: bool,
 }
 
+fn build_engine(table_uri: &str) -> DeltaResult<(Url, KernelEngine)> {
+    let url = Url::parse(table_uri)
+        .map_err(|e| Error::Generic(format!("invalid table URI {table_uri}: {e}")))?;
+    let store = store_from_url_opts(&url, HashMap::<String, String>::new())?;
+    let engine = DefaultEngineBuilder::new(store).build();
+    Ok((url, engine))
+}
+
+fn open_snapshot(table_uri: &str) -> DeltaResult<(SnapshotRef, KernelEngine)> {
+    let (url, engine) = build_engine(table_uri)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    Ok((snapshot, engine))
+}
+
 /// Open the latest snapshot of the Delta table at `table_uri` and return a short human-readable
-/// summary (version + logical schema). Phase 1 scaffolding: it exercises kernel log replay via the
-/// default (object-store-backed) engine. Cloud credential wiring, file/predicate serialization,
-/// and execution through Comet's `ParquetSource` land in later commits.
+/// summary (version + logical schema).
 pub fn snapshot_summary(table_uri: &str) -> DeltaResult<String> {
     let (snapshot, _engine) = open_snapshot(table_uri)?;
     Ok(format!(
@@ -63,9 +85,7 @@ pub fn snapshot_summary(table_uri: &str) -> DeltaResult<String> {
 }
 
 /// Enumerate the data files that make up the latest snapshot of the Delta table at `table_uri`.
-/// This performs kernel log replay (including checkpoint + JSON commit reconciliation) and returns
-/// one entry per live data file. Phase 2: no predicate pushdown yet, so every live file is
-/// returned.
+/// Performs kernel log replay; every live data file is returned (no predicate pushdown yet).
 pub fn list_scan_files(table_uri: &str) -> DeltaResult<Vec<DeltaScanFile>> {
     let (snapshot, engine) = open_snapshot(table_uri)?;
     let scan = snapshot.scan_builder().build()?;
@@ -76,7 +96,6 @@ pub fn list_scan_files(table_uri: &str) -> DeltaResult<Vec<DeltaScanFile>> {
     Ok(files)
 }
 
-/// Callback invoked by the kernel for each live data file during log replay.
 fn visit_scan_file(files: &mut Vec<DeltaScanFile>, scan_file: ScanFile) {
     files.push(DeltaScanFile {
         path: scan_file.path.to_string(),
@@ -85,50 +104,215 @@ fn visit_scan_file(files: &mut Vec<DeltaScanFile>, scan_file: ScanFile) {
     });
 }
 
-/// Build a kernel default engine for `table_uri` and load its latest snapshot. The engine is
-/// returned alongside the snapshot because scan execution needs it. Credential wiring (S3/Azure/
-/// GCS) is intentionally deferred; this uses anonymous/default object-store configuration.
-fn open_snapshot(
-    table_uri: &str,
-) -> DeltaResult<(
-    delta_kernel::SnapshotRef,
-    delta_kernel::engine::default::DefaultEngine<
-        delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor,
-    >,
-)> {
-    let url = Url::parse(table_uri)
-        .map_err(|e| delta_kernel::Error::Generic(format!("invalid table URI {table_uri}: {e}")))?;
-    let store = store_from_url_opts(&url, HashMap::<String, String>::new())?;
-    let engine = DefaultEngineBuilder::new(store).build();
+/// Read the latest snapshot of the Delta table at `table_uri` into Arrow `RecordBatch`es. The
+/// kernel applies deletion vectors and column-mapping transforms and injects partition values, so
+/// the returned batches are logically correct, Spark-compatible Arrow data.
+pub fn scan_to_batches(table_uri: &str) -> DeltaResult<Vec<RecordBatch>> {
+    let (snapshot, engine) = open_snapshot(table_uri)?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches: Vec<RecordBatch> = scan
+        .execute(Arc::new(engine))?
+        .map(EngineDataArrowExt::try_into_record_batch)
+        .try_collect()?;
+    Ok(batches)
+}
+
+/// Create an empty Delta table with the given logical schema at `table_uri`. Errors if the table
+/// already exists.
+pub fn create_table(table_uri: &str, schema: SchemaRef) -> DeltaResult<()> {
+    let (url, engine) = build_engine(table_uri)?;
+    let _committed = kernel_create_table(url.as_str(), schema, "datafusion-comet/delta")
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?;
+    Ok(())
+}
+
+/// Append one Arrow `RecordBatch` to the (existing, unpartitioned) Delta table at `table_uri` as a
+/// single transactional commit, returning the committed version. The batch schema must match the
+/// table's physical schema.
+pub async fn append(table_uri: &str, data: RecordBatch) -> DeltaResult<u64> {
+    let (url, engine) = build_engine(table_uri)?;
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
-    Ok((snapshot, engine))
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .with_operation("WRITE".to_string())
+        .with_engine_info("datafusion-comet/delta")
+        .with_data_change(true);
+
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    let engine_data = ArrowEngineData::new(data);
+    let file_metadata = engine
+        .write_parquet(&engine_data, write_context.as_ref())
+        .await?;
+    txn.add_files(file_metadata);
+
+    let mut retries = 0;
+    loop {
+        if retries > 5 {
+            return Err(Error::generic(
+                "exceeded maximum retries committing transaction",
+            ));
+        }
+        txn = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(committed) => return Ok(committed.commit_version()),
+            CommitResult::ConflictedTransaction(conflicted) => {
+                return Err(Error::generic(format!(
+                    "transaction conflicted with version {}",
+                    conflicted.conflict_version()
+                )));
+            }
+            CommitResult::RetryableTransaction(RetryableTransaction { transaction, .. }) => {
+                transaction
+            }
+        };
+        retries += 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{list_scan_files, snapshot_summary};
+    use super::*;
+    use delta_kernel::arrow::array::{Float64Array, Int64Array};
+    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    /// (id: long, score: double)
+    fn test_schema() -> SchemaRef {
+        Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("score", DataType::DOUBLE),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn make_batch(schema: &SchemaRef, start: i64, n: i64) -> RecordBatch {
+        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+        let ids = Int64Array::from((start..start + n).collect::<Vec<_>>());
+        let scores = Float64Array::from(
+            (start..start + n)
+                .map(|i| i as f64 * 1.5)
+                .collect::<Vec<_>>(),
+        );
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(ids), Arc::new(scores)],
+        )
+        .unwrap()
+    }
+
+    fn table_uri(dir: &TempDir) -> String {
+        Url::from_directory_path(dir.path()).unwrap().to_string()
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
 
     #[test]
     fn opening_a_missing_table_returns_err() {
-        // No fixture is created here; the goal is to prove the kernel read path links and is
-        // callable. A missing table must surface as an error rather than panic.
         assert!(snapshot_summary("file:///definitely/not/a/delta/table").is_err());
         assert!(list_scan_files("file:///definitely/not/a/delta/table").is_err());
+        assert!(scan_to_batches("file:///definitely/not/a/delta/table").is_err());
     }
 
-    /// Happy-path check against a real Delta table. Skipped unless `COMET_DELTA_TEST_TABLE` points
-    /// at a table URI (e.g. `file:///tmp/my-delta`), so CI stays self-contained. Run locally with:
-    /// `COMET_DELTA_TEST_TABLE=file:///path cargo test -p datafusion-comet --features delta`.
     #[test]
-    fn lists_files_for_real_table_when_env_set() {
-        let Ok(uri) = std::env::var("COMET_DELTA_TEST_TABLE") else {
-            eprintln!("skipping: set COMET_DELTA_TEST_TABLE to run");
-            return;
-        };
-        let summary = snapshot_summary(&uri).expect("snapshot_summary");
-        let files = list_scan_files(&uri).expect("list_scan_files");
-        eprintln!("{summary}");
-        eprintln!("scan files ({}): {:#?}", files.len(), files);
-        assert!(!files.is_empty(), "expected at least one data file");
+    fn create_append_read_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+
+        create_table(&uri, Arc::clone(&schema)).unwrap();
+        // two separate commits => two versions, two data files
+        let v1 = rt()
+            .block_on(append(&uri, make_batch(&schema, 0, 5)))
+            .unwrap();
+        let v2 = rt()
+            .block_on(append(&uri, make_batch(&schema, 5, 3)))
+            .unwrap();
+        assert!(v2 > v1, "each append should advance the table version");
+
+        assert_eq!(
+            list_scan_files(&uri).unwrap().len(),
+            2,
+            "expected two files"
+        );
+
+        let batches = scan_to_batches(&uri).unwrap();
+        assert_eq!(total_rows(&batches), 8);
+
+        // verify the actual values round-trip
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn newly_created_table_is_empty_and_keeps_schema() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        create_table(&uri, test_schema()).unwrap();
+
+        // No data files, no rows, but the schema is readable.
+        assert_eq!(list_scan_files(&uri).unwrap().len(), 0);
+        assert_eq!(total_rows(&scan_to_batches(&uri).unwrap()), 0);
+        let summary = snapshot_summary(&uri).unwrap();
+        assert!(summary.contains("version=0"), "summary was: {summary}");
+        assert!(summary.contains("id") && summary.contains("score"));
+    }
+
+    #[test]
+    fn perf_scan_throughput() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+        let rows: i64 = std::env::var("COMET_DELTA_PERF_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+
+        create_table(&uri, Arc::clone(&schema)).unwrap();
+        let write_start = Instant::now();
+        rt().block_on(append(&uri, make_batch(&schema, 0, rows)))
+            .unwrap();
+        let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
+
+        // warm up, then measure the read
+        let _ = scan_to_batches(&uri).unwrap();
+        let read_start = Instant::now();
+        let batches = scan_to_batches(&uri).unwrap();
+        let read_secs = read_start.elapsed().as_secs_f64();
+
+        let n = total_rows(&batches);
+        assert_eq!(n as i64, rows);
+        // id:long + score:double = 16 logical bytes/row
+        let bytes = (n as f64) * 16.0;
+        let rows_per_sec = n as f64 / read_secs;
+        let mb_per_sec = bytes / read_secs / (1024.0 * 1024.0);
+        // scalastyle:off
+        eprintln!("=== Native Delta (delta-kernel-rs) scan perf ===");
+        eprintln!("rows               : {n}");
+        eprintln!("write (1 commit)   : {write_ms:.1} ms");
+        eprintln!("read (warm)        : {:.1} ms", read_secs * 1000.0);
+        eprintln!("throughput         : {rows_per_sec:.0} rows/s  ({mb_per_sec:.1} MB/s logical)");
+        // scalastyle:on
     }
 }
