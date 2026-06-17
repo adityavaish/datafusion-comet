@@ -32,7 +32,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, DynamicPruningExpre
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{sideBySide, ArrayBasedMapData, GenericArrayData, MetadataColumnHelper}
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.getExistenceDefaultValues
-import org.apache.spark.sql.comet.{CometBatchScanExec, CometScanExec}
+import org.apache.spark.sql.comet.{CometBatchScanExec, CometDeltaNativeScanExec, CometScanExec, SerializedPlan}
 import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec, SparkPlan, SubqueryAdaptiveBroadcastExec}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -47,6 +47,7 @@ import org.apache.comet.DataTypeSupport.isComplexType
 import org.apache.comet.iceberg.{CometIcebergNativeScanMetadata, IcebergReflection}
 import org.apache.comet.objectstore.NativeConfig
 import org.apache.comet.parquet.CometParquetUtils.{encryptionEnabled, isEncryptionConfigSupported}
+import org.apache.comet.serde.OperatorOuterClass
 import org.apache.comet.serde.operator.{CometIcebergNativeScan, CometNativeScan}
 import org.apache.comet.shims.{CometTypeShim, ShimCometStreaming, ShimFileFormat, ShimSubqueryBroadcast}
 
@@ -162,6 +163,10 @@ case class CometScanRule(session: SparkSession)
 
     scanExec.relation match {
       case r: HadoopFsRelation =>
+        tryDeltaNativeScan(scanExec, r) match {
+          case Some(deltaScan) => return deltaScan
+          case None => // not an eligible native Delta scan; continue with normal handling
+        }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withFallbackReason(scanExec, s"Unsupported file format ${r.fileFormat}")
         }
@@ -187,6 +192,35 @@ case class CometScanRule(session: SparkSession)
       case _ =>
         withFallbackReason(scanExec, s"Unsupported relation ${scanExec.relation}")
     }
+  }
+
+  /**
+   * Attempt to read a Delta scan natively via delta-kernel-rs. Returns `Some` when this scan is
+   * an eligible Delta scan and `spark.comet.scan.deltaNative.enabled` is on. v1 is intentionally
+   * conservative: non-partitioned tables read with all columns (no projection) and no data
+   * filters, so the kernel's full-table read matches Spark's output exactly. Everything else
+   * returns `None` and falls through to the normal scan handling.
+   */
+  private def tryDeltaNativeScan(
+      scanExec: FileSourceScanExec,
+      r: HadoopFsRelation): Option[SparkPlan] = {
+    if (!CometConf.COMET_DELTA_NATIVE_ENABLED.get()) {
+      return None
+    }
+    if (r.fileFormat.getClass.getName != "org.apache.spark.sql.delta.DeltaParquetFileFormat") {
+      return None
+    }
+    val readsAllColumns =
+      scanExec.requiredSchema.fieldNames.toSeq == r.dataSchema.fieldNames.toSeq
+    val rootPaths = r.location.rootPaths
+    if (r.partitionSchema.nonEmpty || !readsAllColumns || scanExec.dataFilters.nonEmpty ||
+      rootPaths.length != 1) {
+      return None
+    }
+    val tableUri = rootPaths.head.toUri.toString
+    val deltaScan = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri).build()
+    val op = OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScan).build()
+    Some(CometDeltaNativeScanExec(op, scanExec.output, tableUri, scanExec, SerializedPlan(None)))
   }
 
   private def nativeScan(
