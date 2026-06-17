@@ -197,10 +197,12 @@ case class CometScanRule(session: SparkSession)
   /**
    * Attempt to read a Delta scan natively via delta-kernel-rs. Returns `Some` when this scan is
    * an eligible Delta scan and `spark.comet.scan.deltaNative.enabled` is on. v1 supports column
-   * projection (the kernel reads only the required columns, in order) but is otherwise
-   * conservative: non-partitioned tables with no data filters, so the kernel's read matches
-   * Spark's output exactly. Everything else returns `None` and falls through to the normal scan
-   * handling.
+   * projection (the kernel reads only the output columns, in order) and partitioned tables (the
+   * kernel injects partition values). It is otherwise conservative: it bails when the scan
+   * carries partition filters (Spark consumes those during file pruning with no Filter node
+   * above, so a full kernel read would return pruned-away rows) or data filters (kept on Spark to
+   * preserve Parquet row-group skipping until kernel predicate pushdown lands). Everything else
+   * returns `None` and falls through to the normal scan handling.
    */
   private def tryDeltaNativeScan(
       scanExec: FileSourceScanExec,
@@ -212,13 +214,16 @@ case class CometScanRule(session: SparkSession)
       return None
     }
     val rootPaths = r.location.rootPaths
-    if (r.partitionSchema.nonEmpty || scanExec.dataFilters.nonEmpty || rootPaths.length != 1) {
+    if (scanExec.partitionFilters.nonEmpty || scanExec.dataFilters.nonEmpty ||
+      rootPaths.length != 1) {
       return None
     }
     val tableUri = rootPaths.head.toUri.toString
-    val requiredSchema = schema2Proto(scanExec.requiredSchema.fields)
+    // Project by the scan's full output (data + partition columns, in output order) so the kernel
+    // selects exactly those columns and injects partition values.
+    val outputSchema = schema2Proto(scanExec.schema.fields)
     val deltaScanBuilder = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri)
-    requiredSchema.foreach(deltaScanBuilder.addRequiredSchema)
+    outputSchema.foreach(deltaScanBuilder.addRequiredSchema)
     val op =
       OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScanBuilder.build()).build()
     Some(CometDeltaNativeScanExec(op, scanExec.output, tableUri, scanExec, SerializedPlan(None)))

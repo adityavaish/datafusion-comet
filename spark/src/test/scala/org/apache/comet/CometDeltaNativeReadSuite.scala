@@ -98,6 +98,71 @@ class CometDeltaNativeReadSuite extends CometTestBase {
     }
   }
 
+  test("native Delta scan reads a partitioned table") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark
+          .range(0, 60)
+          .selectExpr(
+            "id",
+            "cast(id as double) * 1.5 as score",
+            "cast(id % 3 as int) as part_i",
+            "concat('p', cast(id % 2 as string)) as part_s")
+          .write
+          .format("delta")
+          .partitionBy("part_i", "part_s")
+          .save(path)
+
+        // Full read of all partitions (no partition filter): partition values are injected by the
+        // kernel and must match Spark, including the partition columns.
+        val df = spark.read.format("delta").load(path)
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        info(s"plan nodes: ${names.mkString(", ")}")
+        assert(
+          names.contains("CometDeltaNativeScanExec"),
+          s"expected a native Delta scan, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
+  test("native Delta scan falls back to Spark for a partition filter") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark
+          .range(0, 30)
+          .selectExpr("id", "cast(id % 3 as int) as part_i")
+          .write
+          .format("delta")
+          .partitionBy("part_i")
+          .save(path)
+
+        // A partition predicate is consumed by file pruning with no Filter node above, so the
+        // native full-read path must not fire (it would return pruned-away rows).
+        val df = spark.read.format("delta").load(path).where("part_i = 1")
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        assert(
+          !names.contains("CometDeltaNativeScanExec"),
+          s"native Delta scan must not fire with a partition filter, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
   test("native Delta scan falls back to Spark when disabled") {
     assumeDeltaFeature()
     withSQLConf(
