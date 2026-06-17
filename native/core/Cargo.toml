@@ -78,6 +78,10 @@ iceberg-storage-opendal = { workspace = true }
 reqsign-core = { workspace = true }
 serde_json = "1.0"
 uuid = "1.23.3"
+# Optional: native Delta Lake integration via delta-kernel-rs. Engine-agnostic (no DataFusion
+# dependency), pinned to the arrow-58 feature to match Comet's arrow version. Enabled by the
+# `delta` cargo feature; off by default.
+delta_kernel = { version = "0.24.0", default-features = false, features = ["default-engine-rustls", "arrow-58"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18.0"
@@ -97,13 +101,14 @@ datafusion-functions-nested = { version = "53.1.0" }
 [features]
 backtrace = ["datafusion/backtrace"]
 default = ["hdfs-opendal"]
+delta = ["dep:delta_kernel"]
 hdfs = ["datafusion-comet-objectstore-hdfs"]
 hdfs-opendal = ["opendal", "object_store_opendal", "hdfs-sys"]
 jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 
 # exclude optional packages from cargo machete verifications
 [package.metadata.cargo-machete]
-ignored = ["hdfs-sys", "paste"]
+ignored = ["hdfs-sys", "paste", "delta_kernel"]
 
 [lib]
 name = "comet"

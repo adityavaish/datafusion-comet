@@ -68,6 +68,9 @@ use errors::{try_unwrap_or_throw, CometError, CometResult};
 pub mod cloud;
 pub mod execution;
 pub mod parquet;
+// Native Delta Lake integration via delta-kernel-rs. Compiled only with the `delta` feature.
+#[cfg(feature = "delta")]
+pub mod delta;
 // this module is for non release only. Intended for debugging/profiling purposes
 #[cfg(debug_assertions)]
 pub mod debug;
