@@ -1597,6 +1597,31 @@ impl PhysicalPlanner {
                     )),
                 ))
             }
+            OpStruct::DeltaScan(scan) => {
+                #[cfg(feature = "delta")]
+                {
+                    let delta_scan = crate::delta::DeltaScanExec::try_new(scan.table_uri.clone())
+                        .map_err(|e| {
+                        GeneralError(format!("Failed to create DeltaScanExec: {e}"))
+                    })?;
+                    Ok((
+                        vec![],
+                        vec![],
+                        Arc::new(SparkPlan::new(
+                            spark_plan.plan_id,
+                            Arc::new(delta_scan),
+                            vec![],
+                        )),
+                    ))
+                }
+                #[cfg(not(feature = "delta"))]
+                {
+                    let _ = scan;
+                    Err(GeneralError(
+                        "DeltaScan requires Comet to be built with the `delta` feature".into(),
+                    ))
+                }
+            }
             OpStruct::ShuffleWriter(writer) => {
                 assert_eq!(children.len(), 1);
                 let (scans, shuffle_scans, child) =

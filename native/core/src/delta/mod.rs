@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -43,6 +45,9 @@ use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Error, Snapshot, SnapshotRef};
 use itertools::Itertools;
 use url::Url;
+
+mod scan_exec;
+pub use scan_exec::DeltaScanExec;
 
 /// The kernel default engine specialized for Comet (tokio-backed object-store IO).
 type KernelEngine = DefaultEngine<TokioBackgroundExecutor>;
@@ -117,6 +122,15 @@ pub fn scan_to_batches(table_uri: &str) -> DeltaResult<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+/// Read the latest snapshot's logical schema as an Arrow schema. Used by `DeltaScanExec` to
+/// report its output schema without reading any data.
+pub fn snapshot_arrow_schema(table_uri: &str) -> DeltaResult<ArrowSchemaRef> {
+    let (snapshot, _engine) = open_snapshot(table_uri)?;
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema =
+        snapshot.schema().as_ref().try_into_arrow()?;
+    Ok(Arc::new(arrow_schema))
+}
+
 /// Create an empty Delta table with the given logical schema at `table_uri`. Errors if the table
 /// already exists.
 pub fn create_table(table_uri: &str, schema: SchemaRef) -> DeltaResult<()> {
@@ -174,7 +188,6 @@ mod tests {
     use super::*;
     use delta_kernel::arrow::array::{Float64Array, Int64Array};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-    use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use std::time::Instant;
     use tempfile::TempDir;

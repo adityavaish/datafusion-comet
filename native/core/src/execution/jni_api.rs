@@ -240,6 +240,7 @@ fn op_name(op: &OpStruct) -> &'static str {
         OpStruct::CsvScan(_) => "CsvScan",
         OpStruct::ShuffleScan(_) => "ShuffleScan",
         OpStruct::BroadcastNestedLoopJoin(_) => "BroadcastNestedLoopJoin",
+        OpStruct::DeltaScan(_) => "DeltaScan",
     }
 }
 
