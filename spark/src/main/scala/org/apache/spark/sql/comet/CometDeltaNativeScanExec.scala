@@ -35,9 +35,10 @@ import org.apache.comet.serde.OperatorOuterClass.Operator
 /**
  * Native Delta Lake scan that reads a table through delta-kernel-rs (behind the `delta` cargo
  * feature). The native `DeltaScan` operator is self-contained - it carries the table URI and the
- * kernel performs log replay, deletion-vector and column-mapping application, and partition-value
- * injection - so this leaf needs no per-partition planning data and reads the table as a single
- * partition. Projection, partition pruning, and predicate pushdown are follow-ups.
+ * required column projection, and the kernel performs log replay, column pruning, deletion-vector
+ * and column-mapping application, and partition-value injection - so this leaf needs no
+ * per-partition planning data and reads the table as a single partition. Partition pruning and
+ * predicate pushdown are follow-ups.
  */
 case class CometDeltaNativeScanExec(
     override val nativeOp: Operator,

@@ -69,6 +69,35 @@ class CometDeltaNativeReadSuite extends CometTestBase {
     }
   }
 
+  test("native Delta scan prunes to the projected columns") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark
+          .range(0, 50)
+          .selectExpr("id", "cast(id as double) * 1.5 as score", "cast(id as string) as label")
+          .write
+          .format("delta")
+          .save(path)
+
+        // Select a subset of columns, reordered relative to the table schema.
+        val df = spark.read.format("delta").load(path).select("label", "id")
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        info(s"plan nodes: ${names.mkString(", ")}")
+        assert(
+          names.contains("CometDeltaNativeScanExec"),
+          s"expected a native Delta scan, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
   test("native Delta scan falls back to Spark when disabled") {
     assumeDeltaFeature()
     withSQLConf(

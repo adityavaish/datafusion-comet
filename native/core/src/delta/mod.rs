@@ -39,7 +39,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Error, Snapshot, SnapshotRef};
@@ -109,12 +109,42 @@ fn visit_scan_file(files: &mut Vec<DeltaScanFile>, scan_file: ScanFile) {
     });
 }
 
-/// Read the latest snapshot of the Delta table at `table_uri` into Arrow `RecordBatch`es. The
-/// kernel applies deletion vectors and column-mapping transforms and injects partition values, so
-/// the returned batches are logically correct, Spark-compatible Arrow data.
-pub fn scan_to_batches(table_uri: &str) -> DeltaResult<Vec<RecordBatch>> {
+/// Build the projected logical read schema for `columns` (selected in the given order), or `None`
+/// to read the table's full schema. Errors if a requested column is not present in the snapshot's
+/// logical schema.
+fn projected_read_schema(
+    snapshot: &Snapshot,
+    columns: Option<&[String]>,
+) -> DeltaResult<Option<SchemaRef>> {
+    let Some(columns) = columns else {
+        return Ok(None);
+    };
+    let full = snapshot.schema();
+    let mut fields = Vec::with_capacity(columns.len());
+    for name in columns {
+        let field = full
+            .field(name)
+            .ok_or_else(|| Error::generic(format!("column `{name}` not found in Delta schema")))?;
+        fields.push(field.clone());
+    }
+    Ok(Some(Arc::new(StructType::try_new(fields)?)))
+}
+
+/// Read the latest snapshot of the Delta table at `table_uri` into Arrow `RecordBatch`es. When
+/// `columns` is `Some`, only those columns are read, in the given order (column pruning); `None`
+/// reads the full schema. The kernel applies deletion vectors and column-mapping transforms and
+/// injects partition values, so the returned batches are logically correct, Spark-compatible Arrow
+/// data.
+pub fn scan_to_batches(
+    table_uri: &str,
+    columns: Option<&[String]>,
+) -> DeltaResult<Vec<RecordBatch>> {
     let (snapshot, engine) = open_snapshot(table_uri)?;
-    let scan = snapshot.scan_builder().build()?;
+    let read_schema = projected_read_schema(&snapshot, columns)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_schema_opt(read_schema)
+        .build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
         .map(EngineDataArrowExt::try_into_record_batch)
@@ -122,12 +152,18 @@ pub fn scan_to_batches(table_uri: &str) -> DeltaResult<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Read the latest snapshot's logical schema as an Arrow schema. Used by `DeltaScanExec` to
-/// report its output schema without reading any data.
-pub fn snapshot_arrow_schema(table_uri: &str) -> DeltaResult<ArrowSchemaRef> {
+/// Read the latest snapshot's logical schema as an Arrow schema, projected to `columns` when
+/// `Some`. Used by `DeltaScanExec` to report its output schema without reading any data.
+pub fn snapshot_arrow_schema(
+    table_uri: &str,
+    columns: Option<&[String]>,
+) -> DeltaResult<ArrowSchemaRef> {
     let (snapshot, _engine) = open_snapshot(table_uri)?;
-    let arrow_schema: delta_kernel::arrow::datatypes::Schema =
-        snapshot.schema().as_ref().try_into_arrow()?;
+    let logical = match projected_read_schema(&snapshot, columns)? {
+        Some(schema) => schema,
+        None => snapshot.schema(),
+    };
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema = logical.as_ref().try_into_arrow()?;
     Ok(Arc::new(arrow_schema))
 }
 
@@ -234,7 +270,7 @@ mod tests {
     fn opening_a_missing_table_returns_err() {
         assert!(snapshot_summary("file:///definitely/not/a/delta/table").is_err());
         assert!(list_scan_files("file:///definitely/not/a/delta/table").is_err());
-        assert!(scan_to_batches("file:///definitely/not/a/delta/table").is_err());
+        assert!(scan_to_batches("file:///definitely/not/a/delta/table", None).is_err());
     }
 
     #[test]
@@ -259,7 +295,7 @@ mod tests {
             "expected two files"
         );
 
-        let batches = scan_to_batches(&uri).unwrap();
+        let batches = scan_to_batches(&uri, None).unwrap();
         assert_eq!(total_rows(&batches), 8);
 
         // verify the actual values round-trip
@@ -286,10 +322,43 @@ mod tests {
 
         // No data files, no rows, but the schema is readable.
         assert_eq!(list_scan_files(&uri).unwrap().len(), 0);
-        assert_eq!(total_rows(&scan_to_batches(&uri).unwrap()), 0);
+        assert_eq!(total_rows(&scan_to_batches(&uri, None).unwrap()), 0);
         let summary = snapshot_summary(&uri).unwrap();
         assert!(summary.contains("version=0"), "summary was: {summary}");
         assert!(summary.contains("id") && summary.contains("score"));
+    }
+
+    #[test]
+    fn projection_reads_only_requested_columns_in_order() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+        create_table(&uri, Arc::clone(&schema)).unwrap();
+        rt().block_on(append(&uri, make_batch(&schema, 0, 4)))
+            .unwrap();
+
+        // Project a single column.
+        let only_score = vec!["score".to_string()];
+        let batches = scan_to_batches(&uri, Some(&only_score)).unwrap();
+        assert_eq!(total_rows(&batches), 4);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "score");
+
+        // Project both columns in reverse order; the output must follow the requested order.
+        let reordered = vec!["score".to_string(), "id".to_string()];
+        let batches = scan_to_batches(&uri, Some(&reordered)).unwrap();
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(batches[0].schema().field(0).name(), "score");
+        assert_eq!(batches[0].schema().field(1).name(), "id");
+
+        // The projected arrow schema matches the projected read.
+        let projected_schema = snapshot_arrow_schema(&uri, Some(&only_score)).unwrap();
+        assert_eq!(projected_schema.fields().len(), 1);
+        assert_eq!(projected_schema.field(0).name(), "score");
+
+        // An unknown column is an error.
+        let missing = vec!["does_not_exist".to_string()];
+        assert!(scan_to_batches(&uri, Some(&missing)).is_err());
     }
 
     #[test]
@@ -308,11 +377,19 @@ mod tests {
             .unwrap();
         let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
-        // warm up, then measure the read
-        let _ = scan_to_batches(&uri).unwrap();
+        // warm up, then measure the full read
+        let _ = scan_to_batches(&uri, None).unwrap();
         let read_start = Instant::now();
-        let batches = scan_to_batches(&uri).unwrap();
+        let batches = scan_to_batches(&uri, None).unwrap();
         let read_secs = read_start.elapsed().as_secs_f64();
+
+        // measure a projected read of a single column (id) to show column-pruning speedup
+        let one_col = vec!["id".to_string()];
+        let _ = scan_to_batches(&uri, Some(&one_col)).unwrap();
+        let proj_start = Instant::now();
+        let proj_batches = scan_to_batches(&uri, Some(&one_col)).unwrap();
+        let proj_secs = proj_start.elapsed().as_secs_f64();
+        assert_eq!(proj_batches[0].num_columns(), 1);
 
         let n = total_rows(&batches);
         assert_eq!(n as i64, rows);
@@ -320,12 +397,15 @@ mod tests {
         let bytes = (n as f64) * 16.0;
         let rows_per_sec = n as f64 / read_secs;
         let mb_per_sec = bytes / read_secs / (1024.0 * 1024.0);
+        let proj_rows_per_sec = n as f64 / proj_secs;
         // scalastyle:off
         eprintln!("=== Native Delta (delta-kernel-rs) scan perf ===");
         eprintln!("rows               : {n}");
         eprintln!("write (1 commit)   : {write_ms:.1} ms");
-        eprintln!("read (warm)        : {:.1} ms", read_secs * 1000.0);
+        eprintln!("read all (warm)    : {:.1} ms", read_secs * 1000.0);
         eprintln!("throughput         : {rows_per_sec:.0} rows/s  ({mb_per_sec:.1} MB/s logical)");
+        eprintln!("read 1 of 2 cols   : {:.1} ms", proj_secs * 1000.0);
+        eprintln!("projected thruput  : {proj_rows_per_sec:.0} rows/s");
         // scalastyle:on
     }
 }

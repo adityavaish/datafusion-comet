@@ -48,7 +48,7 @@ import org.apache.comet.iceberg.{CometIcebergNativeScanMetadata, IcebergReflecti
 import org.apache.comet.objectstore.NativeConfig
 import org.apache.comet.parquet.CometParquetUtils.{encryptionEnabled, isEncryptionConfigSupported}
 import org.apache.comet.serde.OperatorOuterClass
-import org.apache.comet.serde.operator.{CometIcebergNativeScan, CometNativeScan}
+import org.apache.comet.serde.operator.{schema2Proto, CometIcebergNativeScan, CometNativeScan}
 import org.apache.comet.shims.{CometTypeShim, ShimCometStreaming, ShimFileFormat, ShimSubqueryBroadcast}
 
 /**
@@ -196,10 +196,11 @@ case class CometScanRule(session: SparkSession)
 
   /**
    * Attempt to read a Delta scan natively via delta-kernel-rs. Returns `Some` when this scan is
-   * an eligible Delta scan and `spark.comet.scan.deltaNative.enabled` is on. v1 is intentionally
-   * conservative: non-partitioned tables read with all columns (no projection) and no data
-   * filters, so the kernel's full-table read matches Spark's output exactly. Everything else
-   * returns `None` and falls through to the normal scan handling.
+   * an eligible Delta scan and `spark.comet.scan.deltaNative.enabled` is on. v1 supports column
+   * projection (the kernel reads only the required columns, in order) but is otherwise
+   * conservative: non-partitioned tables with no data filters, so the kernel's read matches
+   * Spark's output exactly. Everything else returns `None` and falls through to the normal scan
+   * handling.
    */
   private def tryDeltaNativeScan(
       scanExec: FileSourceScanExec,
@@ -210,16 +211,16 @@ case class CometScanRule(session: SparkSession)
     if (r.fileFormat.getClass.getName != "org.apache.spark.sql.delta.DeltaParquetFileFormat") {
       return None
     }
-    val readsAllColumns =
-      scanExec.requiredSchema.fieldNames.toSeq == r.dataSchema.fieldNames.toSeq
     val rootPaths = r.location.rootPaths
-    if (r.partitionSchema.nonEmpty || !readsAllColumns || scanExec.dataFilters.nonEmpty ||
-      rootPaths.length != 1) {
+    if (r.partitionSchema.nonEmpty || scanExec.dataFilters.nonEmpty || rootPaths.length != 1) {
       return None
     }
     val tableUri = rootPaths.head.toUri.toString
-    val deltaScan = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri).build()
-    val op = OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScan).build()
+    val requiredSchema = schema2Proto(scanExec.requiredSchema.fields)
+    val deltaScanBuilder = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri)
+    requiredSchema.foreach(deltaScanBuilder.addRequiredSchema)
+    val op =
+      OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScanBuilder.build()).build()
     Some(CometDeltaNativeScanExec(op, scanExec.output, tableUri, scanExec, SerializedPlan(None)))
   }
 

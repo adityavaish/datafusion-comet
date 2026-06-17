@@ -1600,10 +1600,23 @@ impl PhysicalPlanner {
             OpStruct::DeltaScan(scan) => {
                 #[cfg(feature = "delta")]
                 {
-                    let delta_scan = crate::delta::DeltaScanExec::try_new(scan.table_uri.clone())
-                        .map_err(|e| {
-                        GeneralError(format!("Failed to create DeltaScanExec: {e}"))
-                    })?;
+                    // An empty required_schema means "read all columns"; otherwise project to the
+                    // requested columns, in order (column pruning + reordering).
+                    let projection: Option<Vec<String>> = if scan.required_schema.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            scan.required_schema
+                                .iter()
+                                .map(|f| f.name.clone())
+                                .collect(),
+                        )
+                    };
+                    let delta_scan =
+                        crate::delta::DeltaScanExec::try_new(scan.table_uri.clone(), projection)
+                            .map_err(|e| {
+                                GeneralError(format!("Failed to create DeltaScanExec: {e}"))
+                            })?;
                     Ok((
                         vec![],
                         vec![],
