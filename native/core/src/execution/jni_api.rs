@@ -1337,3 +1337,24 @@ pub extern "system" fn Java_org_apache_comet_Native_writeDeltaTable(
         Ok(version as jlong)
     })
 }
+
+/// Return [version, numFiles] for the latest snapshot of the Delta table at `table_uri`. The
+/// driver pins `version` into the scan plan and uses `numFiles` to choose a partition count for
+/// split-parallel reads. Compiled only with the `delta` feature.
+#[cfg(feature = "delta")]
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_deltaSnapshotInfo(
+    e: EnvUnowned,
+    _class: JClass,
+    table_uri: JString,
+) -> jlongArray {
+    try_unwrap_or_throw(&e, |env| {
+        let uri: String = table_uri.try_to_string(env)?;
+        let (version, num_files) = crate::delta::snapshot_info(&uri).map_err(|err| {
+            CometError::Internal(format!("native delta snapshot_info failed: {err}"))
+        })?;
+        let long_array = env.new_long_array(2)?;
+        long_array.set_region(env, 0, &[version as jlong, num_files as jlong])?;
+        Ok(long_array.into_raw())
+    })
+}

@@ -44,6 +44,7 @@ case class CometDeltaNativeScanExec(
     override val nativeOp: Operator,
     override val output: Seq[Attribute],
     tableUri: String,
+    numPartitions: Int,
     @transient originalPlan: FileSourceScanExec,
     override val serializedPlanOpt: SerializedPlan)
     extends CometLeafExec {
@@ -52,20 +53,22 @@ case class CometDeltaNativeScanExec(
 
   override val nodeName: String = s"CometDeltaNativeScan $tableUri"
 
-  override lazy val outputPartitioning: Partitioning = UnknownPartitioning(1)
+  override lazy val outputPartitioning: Partitioning = UnknownPartitioning(numPartitions)
 
   override lazy val outputOrdering: Seq[SortOrder] = Nil
 
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val nativeMetrics = CometMetricNode.fromCometPlan(this)
     val serializedPlan = CometExec.serializeNativePlan(nativeOp)
+    // One Spark task per partition; each native DeltaScanExec reads its assigned file subset. The
+    // partition index flows to native via createPlan/executePlan, the count via partitionCount.
     CometExecRDD(
       sparkContext,
       inputRDDs = Seq.empty,
       commonByKey = Map.empty,
       perPartitionByKey = Map.empty,
       serializedPlan = serializedPlan,
-      numPartitions = 1,
+      numPartitions = numPartitions,
       numOutputCols = output.length,
       nativeMetrics = nativeMetrics,
       subqueries = Seq.empty)
@@ -77,7 +80,13 @@ case class CometDeltaNativeScanExec(
     } else {
       serializedPlanOpt
     }
-    CometDeltaNativeScanExec(nativeOp, output, tableUri, originalPlan, newSerializedPlan)
+    CometDeltaNativeScanExec(
+      nativeOp,
+      output,
+      tableUri,
+      numPartitions,
+      originalPlan,
+      newSerializedPlan)
   }
 
   override protected def doCanonicalize(): CometDeltaNativeScanExec = {
@@ -85,18 +94,21 @@ case class CometDeltaNativeScanExec(
       nativeOp,
       output.map(QueryPlan.normalizeExpressions(_, output)),
       tableUri,
+      numPartitions,
       null,
       SerializedPlan(None))
   }
 
-  override def stringArgs: Iterator[Any] = Iterator(output, tableUri)
+  override def stringArgs: Iterator[Any] = Iterator(output, tableUri, numPartitions)
 
   override def equals(obj: Any): Boolean = obj match {
     case other: CometDeltaNativeScanExec =>
       tableUri == other.tableUri && output == other.output &&
+      numPartitions == other.numPartitions &&
       serializedPlanOpt == other.serializedPlanOpt
     case _ => false
   }
 
-  override def hashCode(): Int = Objects.hashCode(tableUri, output.asJava, serializedPlanOpt)
+  override def hashCode(): Int =
+    Objects.hashCode(tableUri, Int.box(numPartitions), output.asJava, serializedPlanOpt)
 }

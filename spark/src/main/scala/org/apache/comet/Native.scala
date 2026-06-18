@@ -89,6 +89,14 @@ class Native extends NativeBase {
   @native def writeDeltaTable(tableUri: String, ipcData: Array[Byte]): Long
 
   /**
+   * Return [version, numFiles] for the latest snapshot of a Delta table, used on the driver to
+   * pin the snapshot version and choose a split-parallel partition count for the native scan.
+   * Only implemented in native builds with the `delta` cargo feature; callers must gate on
+   * `isFeatureEnabled("delta")`.
+   */
+  @native def deltaSnapshotInfo(tableUri: String): Array[Long]
+
+  /**
    * Execute a native query plan based on given input Arrow arrays.
    *
    * @param stage

@@ -21,6 +21,7 @@ package org.apache.comet
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.CometTestBase
+import org.apache.spark.sql.comet.CometDeltaNativeScanExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -40,6 +41,81 @@ class CometDeltaNativeReadSuite extends CometTestBase {
 
   private def assumeDeltaFeature(): Unit =
     assume(isFeatureEnabled("delta"), "Comet was not built with the `delta` cargo feature")
+
+  private def nativeScanPartitions(df: org.apache.spark.sql.DataFrame): Int =
+    stripAQEPlan(df.queryExecution.executedPlan)
+      .collect { case s: CometDeltaNativeScanExec =>
+        s.numPartitions
+      }
+      .headOption
+      .getOrElse(0)
+
+  test("native split scan over a multi-file table matches Spark") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        // Range-partition into 8 files so the native scan splits across multiple partitions.
+        spark
+          .range(0, 4000)
+          .selectExpr("id", "cast(id as double) * 1.5 as score", "cast(id as string) as label")
+          .repartitionByRange(8, org.apache.spark.sql.functions.col("id"))
+          .write
+          .format("delta")
+          .save(path)
+
+        val df = spark.read.format("delta").load(path)
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        assert(
+          names.contains("CometDeltaNativeScanExec"),
+          s"expected a native Delta scan, got: ${names.mkString(", ")}")
+        val parts = nativeScanPartitions(df)
+        info(s"native scan partitions: $parts")
+        assert(parts > 1, s"expected a split (multi-partition) native scan, got $parts")
+        checkSparkAnswer(df)
+        // An aggregate over the split scan must also match Spark.
+        checkSparkAnswer(df.groupBy("label").count())
+      }
+    }
+  }
+
+  test("native Delta scan falls back for deletion-vector (merge-on-read) tables") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark
+          .range(0, 2000)
+          .selectExpr("id", "cast(id as double) as score")
+          .repartitionByRange(6, org.apache.spark.sql.functions.col("id"))
+          .write
+          .format("delta")
+          .option("delta.enableDeletionVectors", "true")
+          .save(path)
+        // DELETE creates deletion vectors (merge-on-read): Delta's scan reads hidden
+        // __delta_internal_* columns + a Filter, so the native scan must fall back. Results,
+        // produced by Spark, must still be correct.
+        spark.sql(s"DELETE FROM delta.`$path` WHERE id % 7 = 0")
+
+        val df = spark.read.format("delta").load(path)
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        assert(
+          !names.contains("CometDeltaNativeScanExec"),
+          s"native scan must fall back for a merge-on-read DV table, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
 
   test("native Delta scan with a data filter matches Spark across multiple files") {
     assumeDeltaFeature()

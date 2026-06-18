@@ -40,7 +40,7 @@ import org.apache.spark.sql.execution.datasources.v2.csv.CSVScan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
-import org.apache.comet.{CometConf, DataTypeSupport}
+import org.apache.comet.{CometConf, DataTypeSupport, Native}
 import org.apache.comet.CometConf._
 import org.apache.comet.CometSparkSessionExtensions.{isCometLoaded, isSpark35Plus, withFallbackReason, withFallbackReasons}
 import org.apache.comet.DataTypeSupport.isComplexType
@@ -218,11 +218,34 @@ case class CometScanRule(session: SparkSession)
     if (scanExec.partitionFilters.nonEmpty || rootPaths.length != 1) {
       return None
     }
+    // Deletion-vector (merge-on-read) tables: Delta reads hidden `__delta_internal_*` metadata
+    // columns and applies a separate Filter to drop deleted rows. The native scan applies deletion
+    // vectors at the scan level (no such columns/filter), so the two plan shapes are incompatible.
+    // Fall back to Spark for these.
+    if (scanExec.schema.fieldNames.exists(_.startsWith("__delta_internal")) ||
+      scanExec.requiredSchema.fieldNames.exists(_.startsWith("__delta_internal"))) {
+      return None
+    }
     val tableUri = rootPaths.head.toUri.toString
+    // Pin the snapshot version (so every split partition reads the same snapshot) and pick a
+    // partition count from the live file count vs. available cores. A native error here (e.g. an
+    // unreadable table) falls back to Spark.
+    val (version, numPartitions) =
+      try {
+        val info = new Native().deltaSnapshotInfo(tableUri) // [version, numFiles]
+        val numFiles = info(1).toInt
+        val cores = math.max(1, session.sparkContext.defaultParallelism)
+        (info(0), math.max(1, math.min(cores, numFiles)))
+      } catch {
+        case _: Throwable => return None
+      }
     // Project by the scan's full output (data + partition columns, in output order) so the kernel
     // selects exactly those columns and injects partition values.
     val outputSchema = schema2Proto(scanExec.schema.fields)
-    val deltaScanBuilder = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri)
+    val deltaScanBuilder = OperatorOuterClass.DeltaScan
+      .newBuilder()
+      .setTableUri(tableUri)
+      .setVersion(version)
     outputSchema.foreach(deltaScanBuilder.addRequiredSchema)
     // Serialize data filters as unbound (by-name) references for best-effort kernel data skipping.
     // Unsupported filters are dropped here (or in native translation); a Filter above the scan
@@ -232,7 +255,14 @@ case class CometScanRule(session: SparkSession)
       .foreach(deltaScanBuilder.addDataFilters)
     val op =
       OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScanBuilder.build()).build()
-    Some(CometDeltaNativeScanExec(op, scanExec.output, tableUri, scanExec, SerializedPlan(None)))
+    Some(
+      CometDeltaNativeScanExec(
+        op,
+        scanExec.output,
+        tableUri,
+        numPartitions,
+        scanExec,
+        SerializedPlan(None)))
   }
 
   private def nativeScan(

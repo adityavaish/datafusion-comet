@@ -107,6 +107,8 @@ message DeltaScan {
   // file-level data skipping. Best-effort: a Filter above the scan still enforces correctness, so
   // only the supported subset is translated; the rest are dropped.
   repeated spark.spark_expression.Expr data_filters = 3;
+  // Snapshot version to pin, so every split-read partition reads the identical snapshot.
+  int64 version = 4;
 }
 
 // Common data shared by all partitions in split mode (sent once at planning)

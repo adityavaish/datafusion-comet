@@ -36,19 +36,23 @@ use delta_kernel::expressions::PredicateRef;
 use futures::TryStreamExt;
 
 use super::predicate::translate_filters;
-use super::{scan_to_batches, snapshot_arrow_schema};
+use super::{scan_to_batches, scan_to_batches_split, snapshot_arrow_schema};
 
 /// Leaf operator that reads a Delta table through the kernel default engine and emits the
 /// resulting Arrow batches. The kernel applies deletion vectors, column mapping, and partition
 /// values, so the output is Spark-correct. When `projection` is `Some`, only those columns are
 /// read, in the given order (column pruning). Translatable data filters are pushed into the kernel
-/// for best-effort file skipping. This v1 reads the table as a single partition; per-file split
-/// parallelism is a follow-up.
+/// for best-effort file skipping. When `num_partitions > 1`, this instance reads only the file
+/// subset assigned to `partition_index` (from the pinned `version`), so the read parallelizes
+/// across Spark cores; with a single partition it uses the kernel's all-in-one read.
 #[derive(Debug)]
 pub struct DeltaScanExec {
     table_uri: String,
     projection: Option<Vec<String>>,
     predicate: Option<PredicateRef>,
+    version: Option<u64>,
+    partition_index: usize,
+    num_partitions: usize,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -59,10 +63,15 @@ impl DeltaScanExec {
     /// is `Some`, the output schema is pruned to those columns, in order. `data_filters` are the
     /// scan's Spark filters; the supported subset is translated into a kernel predicate for data
     /// skipping (the rest are dropped — correctness is enforced by a Filter above the scan).
+    /// `version`/`partition_index`/`num_partitions` drive split-parallel reads (one Spark task per
+    /// partition, each reading a disjoint file subset of the pinned snapshot).
     pub fn try_new(
         table_uri: String,
         projection: Option<Vec<String>>,
         data_filters: &[spark_expression::Expr],
+        version: Option<u64>,
+        partition_index: usize,
+        num_partitions: usize,
     ) -> DFResult<Self> {
         let output_schema =
             snapshot_arrow_schema(&table_uri, projection.as_deref()).map_err(|e| {
@@ -79,6 +88,9 @@ impl DeltaScanExec {
             table_uri,
             projection,
             predicate,
+            version,
+            partition_index,
+            num_partitions: num_partitions.max(1),
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -128,13 +140,28 @@ impl ExecutionPlan for DeltaScanExec {
         let table_uri = self.table_uri.clone();
         let projection = self.projection.clone();
         let predicate = self.predicate.clone();
+        let version = self.version;
+        let partition_index = self.partition_index;
+        let num_partitions = self.num_partitions;
         let schema = Arc::clone(&self.output_schema);
 
         // The kernel read is synchronous and blocking; run it on a blocking worker so it does not
-        // stall the tokio reactor, then stream the resulting batches.
+        // stall the tokio reactor, then stream the resulting batches. With a single partition use
+        // the kernel's all-in-one read; otherwise read only this partition's file subset.
         let fut = async move {
             let batches = tokio::task::spawn_blocking(move || {
-                scan_to_batches(&table_uri, projection.as_deref(), predicate)
+                if num_partitions > 1 {
+                    scan_to_batches_split(
+                        &table_uri,
+                        projection.as_deref(),
+                        predicate,
+                        version,
+                        partition_index,
+                        num_partitions,
+                    )
+                } else {
+                    scan_to_batches(&table_uri, projection.as_deref(), predicate)
+                }
             })
             .await
             .map_err(|e| DataFusionError::Execution(format!("delta: scan task failed: {e}")))?
@@ -191,7 +218,7 @@ mod tests {
         rt.block_on(super::super::append(&uri, batch)).unwrap();
 
         let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(DeltaScanExec::try_new(uri, None, &[]).unwrap());
+            Arc::new(DeltaScanExec::try_new(uri, None, &[], None, 0, 1).unwrap());
         assert_eq!(exec.schema().fields().len(), 2);
 
         let ctx = SessionContext::new();
@@ -229,8 +256,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(super::super::append(&uri, batch)).unwrap();
 
-        let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(DeltaScanExec::try_new(uri, Some(vec!["score".to_string()]), &[]).unwrap());
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            DeltaScanExec::try_new(uri, Some(vec!["score".to_string()]), &[], None, 0, 1).unwrap(),
+        );
         assert_eq!(exec.schema().fields().len(), 1);
         assert_eq!(exec.schema().field(0).name(), "score");
 

@@ -1616,6 +1616,13 @@ impl PhysicalPlanner {
                         scan.table_uri.clone(),
                         projection,
                         &scan.data_filters,
+                        if scan.version < 0 {
+                            None
+                        } else {
+                            Some(scan.version as u64)
+                        },
+                        self.partition as usize,
+                        partition_count,
                     )
                     .map_err(|e| GeneralError(format!("Failed to create DeltaScanExec: {e}")))?;
                     Ok((

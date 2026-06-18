@@ -30,7 +30,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::array::{BooleanArray, RecordBatch};
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
@@ -38,11 +39,11 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel::scan::state::ScanFile;
+use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{DeltaResult, Error, Snapshot, SnapshotRef};
+use delta_kernel::{DeltaResult, Engine, Error, FileMeta, Snapshot, SnapshotRef};
 use itertools::Itertools;
 use url::Url;
 
@@ -77,6 +78,35 @@ fn open_snapshot(table_uri: &str) -> DeltaResult<(SnapshotRef, KernelEngine)> {
     let (url, engine) = build_engine(table_uri)?;
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
     Ok((snapshot, engine))
+}
+
+/// Open a snapshot of the Delta table at `table_uri`, pinned to `version` when `Some` (else
+/// latest). Used so every split-read partition reads the exact same snapshot.
+fn open_snapshot_at(
+    table_uri: &str,
+    version: Option<u64>,
+) -> DeltaResult<(SnapshotRef, KernelEngine)> {
+    let (url, engine) = build_engine(table_uri)?;
+    let mut builder = Snapshot::builder_for(url);
+    if let Some(v) = version {
+        builder = builder.at_version(v);
+    }
+    let snapshot = builder.build(&engine)?;
+    Ok((snapshot, engine))
+}
+
+/// Return the latest snapshot's version and live data-file count for the table at `table_uri`. The
+/// driver uses this to pin the version and choose a partition count for split-parallel reads.
+pub fn snapshot_info(table_uri: &str) -> DeltaResult<(u64, u64)> {
+    let (snapshot, engine) = open_snapshot(table_uri)?;
+    let version = snapshot.version();
+    let scan = snapshot.scan_builder().build()?;
+    let mut count: u64 = 0;
+    for batch in scan.scan_metadata(&engine)? {
+        let files = batch?.visit_scan_files(Vec::<()>::new(), |acc, _f| acc.push(()))?;
+        count += files.len() as u64;
+    }
+    Ok((version, count))
 }
 
 /// Open the latest snapshot of the Delta table at `table_uri` and return a short human-readable
@@ -153,6 +183,98 @@ pub fn scan_to_batches(
         .execute(Arc::new(engine))?
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
+    Ok(batches)
+}
+
+/// Split-parallel read: read only the data files assigned to partition `partition_index` of
+/// `num_partitions`, from the snapshot pinned at `version`. Files are enumerated, sorted by path
+/// for a deterministic cross-partition assignment, then partitioned round-robin by index. This
+/// replicates the kernel's per-file read loop (deletion vectors via a keep-mask filter, plus the
+/// logical transform for column mapping / partition values) using only public kernel APIs, so the
+/// output is identical to `scan_to_batches` for the assigned subset. Used by `DeltaScanExec` when
+/// the JVM schedules more than one partition, so the read parallelizes across Spark cores.
+pub fn scan_to_batches_split(
+    table_uri: &str,
+    columns: Option<&[String]>,
+    predicate: Option<delta_kernel::expressions::PredicateRef>,
+    version: Option<u64>,
+    partition_index: usize,
+    num_partitions: usize,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let num_partitions = num_partitions.max(1);
+    let (snapshot, engine) = open_snapshot_at(table_uri, version)?;
+    let read_schema = projected_read_schema(&snapshot, columns)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_schema_opt(read_schema)
+        .with_predicate(predicate)
+        .build()?;
+
+    // Enumerate all live scan files, then sort by path so every partition derives the identical
+    // ordering independently (the round-robin assignment below depends on a stable order).
+    let mut scan_files: Vec<ScanFile> = Vec::new();
+    for batch in scan.scan_metadata(&engine)? {
+        scan_files = batch?.visit_scan_files(scan_files, |acc, f| acc.push(f))?;
+    }
+    scan_files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let table_root = scan.snapshot().table_root().clone();
+    let physical_schema = Arc::clone(scan.physical_schema());
+    let logical_schema = Arc::clone(scan.logical_schema());
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for scan_file in scan_files
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % num_partitions == partition_index)
+        .map(|(_, f)| f)
+    {
+        let file_path = table_root.join(&scan_file.path)?;
+        // Deletion-vector keep-mask for the whole file (true = keep). None when the file has no DV.
+        let mut keep_mask: Option<Vec<bool>> = scan_file
+            .dv_info
+            .get_selection_vector(&engine, &table_root)?;
+        let meta = FileMeta {
+            last_modified: 0,
+            size: scan_file.size as u64,
+            location: file_path,
+        };
+        let read_iter = engine.parquet_handler().read_parquet_files(
+            &[meta],
+            Arc::clone(&physical_schema),
+            None,
+        )?;
+        for read_result in read_iter {
+            let logical = transform_to_logical(
+                &engine,
+                read_result?,
+                &physical_schema,
+                &logical_schema,
+                scan_file.transform.clone(),
+            )?;
+            let batch = logical.try_into_record_batch()?;
+            let n = batch.num_rows();
+            // Consume the leading `n` entries of the keep mask for this batch; the remainder
+            // applies to subsequent batches of the same file. Rows past the mask are kept.
+            let masked = match keep_mask.as_mut() {
+                Some(mask) => {
+                    let rest = if n < mask.len() {
+                        Some(mask.split_off(n))
+                    } else {
+                        None
+                    };
+                    let mut this = std::mem::take(mask);
+                    keep_mask = rest;
+                    if this.len() < n {
+                        this.resize(n, true);
+                    }
+                    Some(filter_record_batch(&batch, &BooleanArray::from(this))?)
+                }
+                None => None,
+            };
+            batches.push(masked.unwrap_or(batch));
+        }
+    }
     Ok(batches)
 }
 
@@ -333,6 +455,77 @@ mod tests {
 
     fn total_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn sorted_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn split_read_covers_all_rows_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+        create_table(&uri, Arc::clone(&schema)).unwrap();
+        // five commits => five data files, so a 3-way split has uneven file counts per partition.
+        for i in 0..5 {
+            rt().block_on(append(&uri, make_batch(&schema, i * 10, 10)))
+                .unwrap();
+        }
+
+        let (version, num_files) = snapshot_info(&uri).unwrap();
+        assert_eq!(num_files, 5);
+
+        let full = sorted_ids(&scan_to_batches(&uri, None, None).unwrap());
+        assert_eq!(full.len(), 50);
+
+        let num_partitions = 3;
+        let mut combined: Vec<i64> = Vec::new();
+        for p in 0..num_partitions {
+            let part =
+                scan_to_batches_split(&uri, None, None, Some(version), p, num_partitions).unwrap();
+            combined.extend(sorted_ids(&part));
+        }
+        combined.sort_unstable();
+        // Every row is read exactly once across the partitions, matching the full read.
+        assert_eq!(combined, full);
+    }
+
+    #[test]
+    fn split_read_with_projection_matches_full() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+        create_table(&uri, Arc::clone(&schema)).unwrap();
+        for i in 0..4 {
+            rt().block_on(append(&uri, make_batch(&schema, i * 8, 8)))
+                .unwrap();
+        }
+        let (version, _) = snapshot_info(&uri).unwrap();
+        let cols = vec!["id".to_string()];
+
+        let mut total = 0usize;
+        for p in 0..2 {
+            let part = scan_to_batches_split(&uri, Some(&cols), None, Some(version), p, 2).unwrap();
+            for b in &part {
+                assert_eq!(b.num_columns(), 1);
+                assert_eq!(b.schema().field(0).name(), "id");
+            }
+            total += total_rows(&part);
+        }
+        assert_eq!(total, 32);
     }
 
     #[test]
