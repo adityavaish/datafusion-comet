@@ -103,6 +103,10 @@ message DeltaScan {
   string table_uri = 1;
   // Required output schema (logical column order and types).
   repeated SparkStructField required_schema = 2;
+  // Data filters (referencing output columns by bound index) to push into the kernel scan for
+  // file-level data skipping. Best-effort: a Filter above the scan still enforces correctness, so
+  // only the supported subset is translated; the rest are dropped.
+  repeated spark.spark_expression.Expr data_filters = 3;
 }
 
 // Common data shared by all partitions in split mode (sent once at planning)

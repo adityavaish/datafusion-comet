@@ -1612,11 +1612,12 @@ impl PhysicalPlanner {
                                 .collect(),
                         )
                     };
-                    let delta_scan =
-                        crate::delta::DeltaScanExec::try_new(scan.table_uri.clone(), projection)
-                            .map_err(|e| {
-                                GeneralError(format!("Failed to create DeltaScanExec: {e}"))
-                            })?;
+                    let delta_scan = crate::delta::DeltaScanExec::try_new(
+                        scan.table_uri.clone(),
+                        projection,
+                        &scan.data_filters,
+                    )
+                    .map_err(|e| GeneralError(format!("Failed to create DeltaScanExec: {e}")))?;
                     Ok((
                         vec![],
                         vec![],

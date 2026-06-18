@@ -46,6 +46,7 @@ use delta_kernel::{DeltaResult, Error, Snapshot, SnapshotRef};
 use itertools::Itertools;
 use url::Url;
 
+mod predicate;
 mod scan_exec;
 pub use scan_exec::DeltaScanExec;
 
@@ -132,18 +133,21 @@ fn projected_read_schema(
 
 /// Read the latest snapshot of the Delta table at `table_uri` into Arrow `RecordBatch`es. When
 /// `columns` is `Some`, only those columns are read, in the given order (column pruning); `None`
-/// reads the full schema. The kernel applies deletion vectors and column-mapping transforms and
-/// injects partition values, so the returned batches are logically correct, Spark-compatible Arrow
-/// data.
+/// reads the full schema. When `predicate` is `Some`, it is pushed into the kernel for best-effort
+/// file-level data skipping (a Filter above the scan still enforces exact correctness). The kernel
+/// applies deletion vectors and column-mapping transforms and injects partition values, so the
+/// returned batches are logically correct, Spark-compatible Arrow data.
 pub fn scan_to_batches(
     table_uri: &str,
     columns: Option<&[String]>,
+    predicate: Option<delta_kernel::expressions::PredicateRef>,
 ) -> DeltaResult<Vec<RecordBatch>> {
     let (snapshot, engine) = open_snapshot(table_uri)?;
     let read_schema = projected_read_schema(&snapshot, columns)?;
     let scan = snapshot
         .scan_builder()
         .with_schema_opt(read_schema)
+        .with_predicate(predicate)
         .build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
@@ -270,7 +274,7 @@ mod tests {
     fn opening_a_missing_table_returns_err() {
         assert!(snapshot_summary("file:///definitely/not/a/delta/table").is_err());
         assert!(list_scan_files("file:///definitely/not/a/delta/table").is_err());
-        assert!(scan_to_batches("file:///definitely/not/a/delta/table", None).is_err());
+        assert!(scan_to_batches("file:///definitely/not/a/delta/table", None, None).is_err());
     }
 
     #[test]
@@ -295,7 +299,7 @@ mod tests {
             "expected two files"
         );
 
-        let batches = scan_to_batches(&uri, None).unwrap();
+        let batches = scan_to_batches(&uri, None, None).unwrap();
         assert_eq!(total_rows(&batches), 8);
 
         // verify the actual values round-trip
@@ -322,7 +326,7 @@ mod tests {
 
         // No data files, no rows, but the schema is readable.
         assert_eq!(list_scan_files(&uri).unwrap().len(), 0);
-        assert_eq!(total_rows(&scan_to_batches(&uri, None).unwrap()), 0);
+        assert_eq!(total_rows(&scan_to_batches(&uri, None, None).unwrap()), 0);
         let summary = snapshot_summary(&uri).unwrap();
         assert!(summary.contains("version=0"), "summary was: {summary}");
         assert!(summary.contains("id") && summary.contains("score"));
@@ -339,14 +343,14 @@ mod tests {
 
         // Project a single column.
         let only_score = vec!["score".to_string()];
-        let batches = scan_to_batches(&uri, Some(&only_score)).unwrap();
+        let batches = scan_to_batches(&uri, Some(&only_score), None).unwrap();
         assert_eq!(total_rows(&batches), 4);
         assert_eq!(batches[0].num_columns(), 1);
         assert_eq!(batches[0].schema().field(0).name(), "score");
 
         // Project both columns in reverse order; the output must follow the requested order.
         let reordered = vec!["score".to_string(), "id".to_string()];
-        let batches = scan_to_batches(&uri, Some(&reordered)).unwrap();
+        let batches = scan_to_batches(&uri, Some(&reordered), None).unwrap();
         assert_eq!(batches[0].num_columns(), 2);
         assert_eq!(batches[0].schema().field(0).name(), "score");
         assert_eq!(batches[0].schema().field(1).name(), "id");
@@ -358,7 +362,7 @@ mod tests {
 
         // An unknown column is an error.
         let missing = vec!["does_not_exist".to_string()];
-        assert!(scan_to_batches(&uri, Some(&missing)).is_err());
+        assert!(scan_to_batches(&uri, Some(&missing), None).is_err());
     }
 
     #[test]
@@ -378,16 +382,16 @@ mod tests {
         let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
         // warm up, then measure the full read
-        let _ = scan_to_batches(&uri, None).unwrap();
+        let _ = scan_to_batches(&uri, None, None).unwrap();
         let read_start = Instant::now();
-        let batches = scan_to_batches(&uri, None).unwrap();
+        let batches = scan_to_batches(&uri, None, None).unwrap();
         let read_secs = read_start.elapsed().as_secs_f64();
 
         // measure a projected read of a single column (id) to show column-pruning speedup
         let one_col = vec!["id".to_string()];
-        let _ = scan_to_batches(&uri, Some(&one_col)).unwrap();
+        let _ = scan_to_batches(&uri, Some(&one_col), None).unwrap();
         let proj_start = Instant::now();
-        let proj_batches = scan_to_batches(&uri, Some(&one_col)).unwrap();
+        let proj_batches = scan_to_batches(&uri, Some(&one_col), None).unwrap();
         let proj_secs = proj_start.elapsed().as_secs_f64();
         assert_eq!(proj_batches[0].num_columns(), 1);
 

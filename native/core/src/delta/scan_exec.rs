@@ -31,19 +31,24 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use datafusion_comet_proto::spark_expression;
+use delta_kernel::expressions::PredicateRef;
 use futures::TryStreamExt;
 
+use super::predicate::translate_filters;
 use super::{scan_to_batches, snapshot_arrow_schema};
 
 /// Leaf operator that reads a Delta table through the kernel default engine and emits the
 /// resulting Arrow batches. The kernel applies deletion vectors, column mapping, and partition
 /// values, so the output is Spark-correct. When `projection` is `Some`, only those columns are
-/// read, in the given order (column pruning). This v1 reads the table as a single partition;
-/// per-file split parallelism is a follow-up.
+/// read, in the given order (column pruning). Translatable data filters are pushed into the kernel
+/// for best-effort file skipping. This v1 reads the table as a single partition; per-file split
+/// parallelism is a follow-up.
 #[derive(Debug)]
 pub struct DeltaScanExec {
     table_uri: String,
     projection: Option<Vec<String>>,
+    predicate: Option<PredicateRef>,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -51,12 +56,19 @@ pub struct DeltaScanExec {
 
 impl DeltaScanExec {
     /// Build the operator, reading the table's logical schema from the Delta log. When `projection`
-    /// is `Some`, the output schema is pruned to those columns, in order.
-    pub fn try_new(table_uri: String, projection: Option<Vec<String>>) -> DFResult<Self> {
+    /// is `Some`, the output schema is pruned to those columns, in order. `data_filters` are the
+    /// scan's Spark filters; the supported subset is translated into a kernel predicate for data
+    /// skipping (the rest are dropped — correctness is enforced by a Filter above the scan).
+    pub fn try_new(
+        table_uri: String,
+        projection: Option<Vec<String>>,
+        data_filters: &[spark_expression::Expr],
+    ) -> DFResult<Self> {
         let output_schema =
             snapshot_arrow_schema(&table_uri, projection.as_deref()).map_err(|e| {
                 DataFusionError::Execution(format!("delta: failed to read schema: {e}"))
             })?;
+        let predicate = translate_filters(data_filters);
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
@@ -66,6 +78,7 @@ impl DeltaScanExec {
         Ok(Self {
             table_uri,
             projection,
+            predicate,
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -114,13 +127,14 @@ impl ExecutionPlan for DeltaScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let table_uri = self.table_uri.clone();
         let projection = self.projection.clone();
+        let predicate = self.predicate.clone();
         let schema = Arc::clone(&self.output_schema);
 
         // The kernel read is synchronous and blocking; run it on a blocking worker so it does not
         // stall the tokio reactor, then stream the resulting batches.
         let fut = async move {
             let batches = tokio::task::spawn_blocking(move || {
-                scan_to_batches(&table_uri, projection.as_deref())
+                scan_to_batches(&table_uri, projection.as_deref(), predicate)
             })
             .await
             .map_err(|e| DataFusionError::Execution(format!("delta: scan task failed: {e}")))?
@@ -176,7 +190,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(super::super::append(&uri, batch)).unwrap();
 
-        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeltaScanExec::try_new(uri, None).unwrap());
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(DeltaScanExec::try_new(uri, None, &[]).unwrap());
         assert_eq!(exec.schema().fields().len(), 2);
 
         let ctx = SessionContext::new();
@@ -215,7 +230,7 @@ mod tests {
         rt.block_on(super::super::append(&uri, batch)).unwrap();
 
         let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(DeltaScanExec::try_new(uri, Some(vec!["score".to_string()])).unwrap());
+            Arc::new(DeltaScanExec::try_new(uri, Some(vec!["score".to_string()]), &[]).unwrap());
         assert_eq!(exec.schema().fields().len(), 1);
         assert_eq!(exec.schema().field(0).name(), "score");
 

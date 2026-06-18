@@ -41,6 +41,80 @@ class CometDeltaNativeReadSuite extends CometTestBase {
   private def assumeDeltaFeature(): Unit =
     assume(isFeatureEnabled("delta"), "Comet was not built with the `delta` cargo feature")
 
+  test("native Delta scan with a data filter matches Spark across multiple files") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        // Three commits => three files with disjoint id ranges, so a kernel data-skipping bug
+        // (skipping a file that holds matching rows) would drop rows and fail checkSparkAnswer.
+        spark
+          .range(0, 30)
+          .selectExpr("id", "cast(id as double) as score")
+          .write
+          .format("delta")
+          .mode("append")
+          .save(path)
+        spark
+          .range(30, 60)
+          .selectExpr("id", "cast(id as double) as score")
+          .write
+          .format("delta")
+          .mode("append")
+          .save(path)
+        spark
+          .range(60, 90)
+          .selectExpr("id", "cast(id as double) as score")
+          .write
+          .format("delta")
+          .mode("append")
+          .save(path)
+
+        val df = spark.read.format("delta").load(path).where("id >= 55 and score < 80.0")
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        info(s"plan nodes: ${names.mkString(", ")}")
+        assert(
+          names.contains("CometDeltaNativeScanExec"),
+          s"expected a native Delta scan, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
+  test("native Delta scan with projection and a data filter matches Spark") {
+    assumeDeltaFeature()
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark
+          .range(0, 200)
+          .selectExpr("id", "cast(id as double) * 1.5 as score", "cast(id as string) as label")
+          .write
+          .format("delta")
+          .save(path)
+
+        // Filter references a column not in the projection; Spark keeps it in requiredSchema.
+        val df =
+          spark.read.format("delta").load(path).where("score > 100.0").select("label", "id")
+        df.collect()
+        val names = stripAQEPlan(df.queryExecution.executedPlan).collect { case p =>
+          p.getClass.getSimpleName
+        }
+        assert(
+          names.contains("CometDeltaNativeScanExec"),
+          s"expected a native Delta scan, got: ${names.mkString(", ")}")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
   test("native Delta scan reads a plain non-partitioned table") {
     assumeDeltaFeature()
     withSQLConf(

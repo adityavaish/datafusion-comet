@@ -48,6 +48,7 @@ import org.apache.comet.iceberg.{CometIcebergNativeScanMetadata, IcebergReflecti
 import org.apache.comet.objectstore.NativeConfig
 import org.apache.comet.parquet.CometParquetUtils.{encryptionEnabled, isEncryptionConfigSupported}
 import org.apache.comet.serde.OperatorOuterClass
+import org.apache.comet.serde.QueryPlanSerde.exprToProto
 import org.apache.comet.serde.operator.{schema2Proto, CometIcebergNativeScan, CometNativeScan}
 import org.apache.comet.shims.{CometTypeShim, ShimCometStreaming, ShimFileFormat, ShimSubqueryBroadcast}
 
@@ -197,12 +198,12 @@ case class CometScanRule(session: SparkSession)
   /**
    * Attempt to read a Delta scan natively via delta-kernel-rs. Returns `Some` when this scan is
    * an eligible Delta scan and `spark.comet.scan.deltaNative.enabled` is on. v1 supports column
-   * projection (the kernel reads only the output columns, in order) and partitioned tables (the
-   * kernel injects partition values). It is otherwise conservative: it bails when the scan
-   * carries partition filters (Spark consumes those during file pruning with no Filter node
-   * above, so a full kernel read would return pruned-away rows) or data filters (kept on Spark to
-   * preserve Parquet row-group skipping until kernel predicate pushdown lands). Everything else
-   * returns `None` and falls through to the normal scan handling.
+   * projection (the kernel reads only the output columns, in order), partitioned tables (the
+   * kernel injects partition values), and best-effort data-filter pushdown for file skipping (the
+   * supported filter subset is translated; a Filter above the scan enforces correctness). It
+   * bails only when the scan carries partition filters, which Spark consumes during file pruning
+   * with no Filter node above, so a full kernel read would return pruned-away rows. Everything
+   * else returns `None` and falls through to the normal scan handling.
    */
   private def tryDeltaNativeScan(
       scanExec: FileSourceScanExec,
@@ -214,8 +215,7 @@ case class CometScanRule(session: SparkSession)
       return None
     }
     val rootPaths = r.location.rootPaths
-    if (scanExec.partitionFilters.nonEmpty || scanExec.dataFilters.nonEmpty ||
-      rootPaths.length != 1) {
+    if (scanExec.partitionFilters.nonEmpty || rootPaths.length != 1) {
       return None
     }
     val tableUri = rootPaths.head.toUri.toString
@@ -224,6 +224,12 @@ case class CometScanRule(session: SparkSession)
     val outputSchema = schema2Proto(scanExec.schema.fields)
     val deltaScanBuilder = OperatorOuterClass.DeltaScan.newBuilder().setTableUri(tableUri)
     outputSchema.foreach(deltaScanBuilder.addRequiredSchema)
+    // Serialize data filters as unbound (by-name) references for best-effort kernel data skipping.
+    // Unsupported filters are dropped here (or in native translation); a Filter above the scan
+    // still enforces correctness.
+    scanExec.dataFilters
+      .flatMap(f => exprToProto(f, scanExec.output, binding = false))
+      .foreach(deltaScanBuilder.addDataFilters)
     val op =
       OperatorOuterClass.Operator.newBuilder().setDeltaScan(deltaScanBuilder.build()).build()
     Some(CometDeltaNativeScanExec(op, scanExec.output, tableUri, scanExec, SerializedPlan(None)))
