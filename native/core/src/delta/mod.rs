@@ -33,7 +33,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -200,6 +200,14 @@ pub async fn append(table_uri: &str, data: RecordBatch) -> DeltaResult<u64> {
         .await?;
     txn.add_files(file_metadata);
 
+    commit_with_retries(txn, &engine)
+}
+
+/// Commit a prepared transaction, retrying on retryable conflicts. Returns the committed version.
+fn commit_with_retries(
+    mut txn: delta_kernel::transaction::Transaction,
+    engine: &KernelEngine,
+) -> DeltaResult<u64> {
     let mut retries = 0;
     loop {
         if retries > 5 {
@@ -207,7 +215,7 @@ pub async fn append(table_uri: &str, data: RecordBatch) -> DeltaResult<u64> {
                 "exceeded maximum retries committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        txn = match txn.commit(engine)? {
             CommitResult::CommittedTransaction(committed) => return Ok(committed.commit_version()),
             CommitResult::ConflictedTransaction(conflicted) => {
                 return Err(Error::generic(format!(
@@ -221,6 +229,63 @@ pub async fn append(table_uri: &str, data: RecordBatch) -> DeltaResult<u64> {
         };
         retries += 1;
     }
+}
+
+/// Write a sequence of Arrow `RecordBatch`es to the unpartitioned Delta table at `table_uri` in a
+/// single transactional commit, creating the table (with `arrow_schema` as its logical schema) if
+/// it does not yet exist. Returns the committed version. The caller must restrict this to eligible
+/// tables (non-partitioned, kernel-supported types); partition columns are not handled here.
+pub async fn write_batches(
+    table_uri: &str,
+    arrow_schema: ArrowSchemaRef,
+    batches: Vec<RecordBatch>,
+) -> DeltaResult<u64> {
+    let (url, engine) = build_engine(table_uri)?;
+
+    // Create the table on first write (no existing snapshot).
+    if Snapshot::builder_for(url.clone()).build(&engine).is_err() {
+        let kernel_schema: SchemaRef = Arc::new(
+            StructType::try_from_arrow(arrow_schema.as_ref())
+                .map_err(|e| Error::generic(format!("arrow->delta schema conversion: {e}")))?,
+        );
+        let _ = kernel_create_table(url.as_str(), kernel_schema, "datafusion-comet/delta")
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+    }
+
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .with_operation("WRITE".to_string())
+        .with_engine_info("datafusion-comet/delta")
+        .with_data_change(true);
+
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    for batch in batches {
+        let engine_data = ArrowEngineData::new(batch);
+        let file_metadata = engine
+            .write_parquet(&engine_data, write_context.as_ref())
+            .await?;
+        txn.add_files(file_metadata);
+    }
+
+    commit_with_retries(txn, &engine)
+}
+
+/// Decode an Arrow IPC stream (schema + zero or more batches) from `ipc_bytes` and write it to the
+/// Delta table at `table_uri` as a single transactional commit (creating the table if missing).
+/// Returns the committed version. Synchronous: drives the kernel's async write on a fresh runtime
+/// so it can be called directly from a JNI thread.
+pub fn write_arrow_ipc(table_uri: &str, ipc_bytes: &[u8]) -> DeltaResult<u64> {
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)
+        .map_err(|e| Error::generic(format!("invalid arrow ipc stream: {e}")))?;
+    let arrow_schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::generic(format!("failed to read arrow ipc batches: {e}")))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| Error::generic(format!("failed to start tokio runtime: {e}")))?;
+    runtime.block_on(write_batches(table_uri, arrow_schema, batches))
 }
 
 #[cfg(test)]
@@ -330,6 +395,60 @@ mod tests {
         let summary = snapshot_summary(&uri).unwrap();
         assert!(summary.contains("version=0"), "summary was: {summary}");
         assert!(summary.contains("id") && summary.contains("score"));
+    }
+
+    #[test]
+    fn write_arrow_ipc_creates_table_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let uri = table_uri(&dir);
+        let schema = test_schema();
+        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+        let arrow_schema_ref = Arc::new(arrow_schema);
+
+        // Two batches => two parquet files written in a single commit; the table is created on the
+        // fly from the IPC stream's schema.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buf, arrow_schema_ref.as_ref())
+                    .unwrap();
+            writer.write(&make_batch(&schema, 0, 4)).unwrap();
+            writer.write(&make_batch(&schema, 4, 3)).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let version = write_arrow_ipc(&uri, &buf).unwrap();
+        assert_eq!(version, 1, "create (v0) then write (v1)");
+        assert_eq!(list_scan_files(&uri).unwrap().len(), 2);
+
+        let batches = scan_to_batches(&uri, None, None).unwrap();
+        assert_eq!(total_rows(&batches), 7);
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..7).collect::<Vec<_>>());
+
+        // A second IPC write appends to the now-existing table.
+        let mut buf2: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buf2, arrow_schema_ref.as_ref())
+                    .unwrap();
+            writer.write(&make_batch(&schema, 7, 2)).unwrap();
+            writer.finish().unwrap();
+        }
+        let version2 = write_arrow_ipc(&uri, &buf2).unwrap();
+        assert_eq!(version2, 2);
+        assert_eq!(total_rows(&scan_to_batches(&uri, None, None).unwrap()), 9);
     }
 
     #[test]

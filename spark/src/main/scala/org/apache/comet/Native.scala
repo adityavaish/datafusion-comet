@@ -74,6 +74,21 @@ class Native extends NativeBase {
   // scalastyle:on
 
   /**
+   * Write an Arrow IPC stream (schema + batches) to a Delta table natively via delta-kernel-rs,
+   * as a single transactional commit, creating the table if it does not exist. Only implemented
+   * in native builds with the `delta` cargo feature; callers must gate on
+   * `isFeatureEnabled("delta")`.
+   *
+   * @param tableUri
+   *   the table root URI (e.g. file:///path).
+   * @param ipcData
+   *   the Arrow IPC stream bytes (schema followed by record batches).
+   * @return
+   *   the committed Delta table version.
+   */
+  @native def writeDeltaTable(tableUri: String, ipcData: Array[Byte]): Long
+
+  /**
    * Execute a native query plan based on given input Arrow arrays.
    *
    * @param stage

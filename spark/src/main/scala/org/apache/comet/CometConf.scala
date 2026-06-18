@@ -138,9 +138,21 @@ object CometConf extends ShimCometConf {
       .doc(
         "Whether to enable native Delta Lake table scan using delta-kernel-rs. Experimental and " +
           "requires Comet to be built with the `delta` cargo feature. When enabled, eligible " +
-          "Delta scans are read directly through native execution. Currently limited to " +
-          "non-partitioned tables read without projection or data filters; other cases fall back " +
-          "to Spark.")
+          "Delta scans (including column projection, partitioned tables, and best-effort data " +
+          "filter pushdown) are read directly through native execution; scans carrying partition " +
+          "filters and other unsupported cases fall back to Spark.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val COMET_DELTA_NATIVE_WRITE_ENABLED: ConfigEntry[Boolean] =
+    conf("spark.comet.write.deltaNative.enabled")
+      .category(CATEGORY_SCAN)
+      .doc("Whether to enable native Delta Lake table writes using delta-kernel-rs. Experimental " +
+        "and requires Comet to be built with the `delta` cargo feature. When enabled, an " +
+        "eligible Delta save (creating a brand-new, non-partitioned table with kernel-supported " +
+        "primitive column types) is written natively; any other case, or any native error, " +
+        "transparently falls back to Delta's own write. The data is collected to the driver, so " +
+        "this is intended for small writes only.")
       .booleanConf
       .createWithDefault(false)
 

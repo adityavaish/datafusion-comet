@@ -1312,3 +1312,28 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_columnarToRowClose(
         Ok(())
     })
 }
+
+// ============================================================================
+// Native Delta Lake write (delta feature only)
+// ============================================================================
+
+/// Write an Arrow IPC stream (`ipc_data`, schema + batches) to the Delta table at `table_uri` as a
+/// single transactional commit, creating the table if it does not exist. Returns the committed
+/// version. Compiled only with the `delta` feature; the Scala side gates the call on
+/// `isFeatureEnabled("delta")`, so the missing symbol in a non-delta build is never reached.
+#[cfg(feature = "delta")]
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_writeDeltaTable(
+    e: EnvUnowned,
+    _class: JClass,
+    table_uri: JString,
+    ipc_data: JByteArray,
+) -> jlong {
+    try_unwrap_or_throw(&e, |env| {
+        let uri: String = table_uri.try_to_string(env)?;
+        let bytes = env.convert_byte_array(ipc_data)?;
+        let version = crate::delta::write_arrow_ipc(&uri, bytes.as_slice())
+            .map_err(|err| CometError::Internal(format!("native delta write failed: {err}")))?;
+        Ok(version as jlong)
+    })
+}

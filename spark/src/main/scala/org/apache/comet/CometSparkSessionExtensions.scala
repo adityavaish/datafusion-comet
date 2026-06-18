@@ -32,7 +32,7 @@ import org.apache.spark.sql.execution._
 import org.apache.spark.sql.internal.SQLConf
 
 import org.apache.comet.CometConf._
-import org.apache.comet.rules.{CometExecRule, CometPlanAdaptiveDynamicPruningFilters, CometReuseSubquery, CometScanRule, CometSpark34AqeDppFallbackRule, EliminateRedundantTransitions}
+import org.apache.comet.rules.{CometDeltaWriteRule, CometExecRule, CometPlanAdaptiveDynamicPruningFilters, CometReuseSubquery, CometScanRule, CometSpark34AqeDppFallbackRule, EliminateRedundantTransitions}
 import org.apache.comet.shims.ShimCometSparkSessionExtensions
 
 /**
@@ -87,6 +87,9 @@ class CometSparkSessionExtensions
     with Logging
     with ShimCometSparkSessionExtensions {
   override def apply(extensions: SparkSessionExtensions): Unit = {
+    // Rewrite eligible Delta writes to a native write command during analysis (before Spark
+    // eagerly executes the command). No-op unless spark.comet.write.deltaNative.enabled is set.
+    extensions.injectPostHocResolutionRule { session => CometDeltaWriteRule(session) }
     extensions.injectColumnar { session => CometScanColumnar(session) }
     extensions.injectColumnar { session => CometExecColumnar(session) }
     // Pre-3.5 only: tag AQE DPP regions so the conversion rules below leave them Spark-native.
